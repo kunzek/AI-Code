@@ -1,0 +1,221 @@
+from google.colab import drive
+
+drive.mount('/content/gdrive')
+
+zip_path = '/content/gdrive/MyDrive/Shoulder_Implant/data.zip'
+import zipfile
+with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+    zip_ref.extractall('/content/Train')
+
+!pip install -Uqq fastbook
+import fastbook
+fastbook.setup_book()
+
+!pip install pydicom
+!pip install git+https://github.com/arraiyopensource/kornia
+
+from fastai import *
+from fastai.vision.all import *
+from fastai.callback.hook import *
+from fastai.callback import *
+from pathlib import Path
+import matplotlib.pyplot as plt
+import seaborn as sns
+import matplotlib.image as immg
+import gc
+import numpy as np
+import pandas as pd
+import random 
+from PIL import Image
+import warnings
+warnings.filterwarnings("ignore")
+from tqdm.notebook import tqdm,tnrange
+import pydicom as dicom
+from fastai.medical.imaging import *
+from statistics import median
+
+
+fnames = get_files('/content/Train',  extensions='.jpg')
+len(fnames)
+
+fnames_df = pd.DataFrame(np.array(fnames))
+
+fnames_df
+
+fnames_df.columns = ['filepath']
+
+fname = []
+for files in fnames_df.filepath:
+  fname.append(str(files).split('/')[-1].split('.')[0])
+
+fnames_df['implant'] = fname
+
+Shoulder_implant = DataBlock(blocks=(ImageBlock, CategoryBlock),
+                get_x=lambda x:x[0],
+                get_y=lambda x:x[1],
+                splitter = RandomSplitter(seed=42),
+                item_tfms = [Resize(size = 512)],
+                batch_tfms=[#IntToFloatTensor(div=2**16-1), 
+                            *aug_transforms(size = 512, min_zoom=1.0, max_zoom=1.2,
+                                            #p_lighting = 0.1
+                                           ), 
+                            Normalize.from_stats(*imagenet_stats)])
+dls = Shoulder_implant.dataloaders(fnames_df, bs =16)# num_workers=0)
+dls.show_batch(max_n=30)#
+
+
+learn = cnn_learner(dls, resnet34, metrics=[accuracy
+                                            ])#, 
+                                            #PrecisionMulti,  RocAuc])
+learn.loss_func
+
+learn.opt_func
+
+
+gc.collect()
+
+learn.fit_one_cycle(75, 1e-3,  
+                    cbs=SaveModelCallback(fname='Shoulder_Implant_Best', 
+                                          monitor = 'valid_loss',
+                                          with_opt=True))
+
+interp = Interpretation.from_learner(learn)
+interp.plot_top_losses(9)
+
+learn.recorder.plot_loss()
+
+learn.fit_one_cycle(50, 1e-3,  
+                    cbs=SaveModelCallback(fname='Shoulder_Implant_Best', 
+                                          monitor = 'valid_loss',
+                                          with_opt=True))
+
+learn.recorder.plot_loss()
+
+learn.unfreeze()
+learn.lr_find()
+
+gc.collect()
+
+learn.fit(10,
+                    lr = slice(1e-6,1e-4))
+
+learn.recorder.plot_loss()
+
+learn.load('/content/gdrive/MyDrive/Shoulder_Implant/Shoulder_Implant_Best')
+
+interp = ClassificationInterpretation.from_learner(learn)
+interp.plot_confusion_matrix()
+
+preds,y, loss = learn.get_preds(with_loss=True)
+
+from sklearn.metrics import roc_curve, auc
+
+probs = np.exp(preds[:,1])
+
+fpr, tpr, thresholds = roc_curve(y, probs, pos_label=1)
+
+roc_auc = auc(fpr, tpr)
+print('ROC area is {0}'.format(roc_auc))
+
+plt.figure()
+plt.plot(fpr, tpr, color='darkorange', label='ROC curve (area = %0.2f)' % roc_auc)
+plt.plot([0, 1], [0, 1], color='navy', linestyle='--')
+plt.xlim([-0.01, 1.0])
+plt.ylim([0.0, 1.01])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Receiver operating characteristic')
+plt.legend(loc="lower right")
+
+learn.load('/content/models/Shoulder_Implant_Best')
+
+class HookActivation():
+    def __init__(self, target_layer):
+        """Initialize a Pytorch hook using `hook_activation` function."""
+
+        self.hook = target_layer.register_forward_hook(self.hook_activation) 
+        
+    def hook_activation(self, target_layer, activ_in, activ_out): 
+        """Create a copy of the layer output activations and save 
+        in `self.stored`.
+        """
+        self.stored = activ_out.detach().clone()
+        
+    def __enter__(self, *args): 
+        return self
+    
+    def __exit__(self, *args): 
+        self.hook.remove()
+
+        
+class HookGradient():
+    def __init__(self, target_layer):
+        """Initialize a Pytorch hook using `hook_gradient` function."""
+        
+        self.hook = target_layer.register_backward_hook(self.hook_gradient)   
+        
+    def hook_gradient(self, target_layer, gradient_in, gradient_out): 
+        """Create a copy of the layer output gradients and save 
+        in `self.stored`.
+        """
+        self.stored = gradient_out[0].detach().clone()
+        
+    def __enter__(self, *args): 
+        return self
+
+    def __exit__(self, *args): 
+        self.hook.remove()
+
+def plot_gradcam(x, learn, hooked_layer, size=512):
+    
+    fig, axes = plt.subplots(1, 5, sharey=True, figsize=(12, 12), dpi=150)
+    x_img = TensorImage(dls.train.decode((x,))[0][0])
+
+    for i, ax in zip([0, 1, 2, 3, 4], axes):
+        with HookGradient(hooked_layer) as hookg:
+            with HookActivation(hooked_layer) as hook:
+                output = learn.model.eval()(x.cuda())
+                act = hook.stored
+ 
+            output[0, i-1].backward()
+            grad = hookg.stored
+            p0, p1, p2, p3 = output.cpu().detach()[0]
+
+        w = grad[0].mean(dim=(1,2), keepdim=True)
+        gradcam_map = (w * act[0]).sum(0).detach().cpu()
+
+        if i == 0:
+          x_img.show(ax=ax)
+          ax.set_axis_off()
+          ax.set_title(dls.vocab[np.argmax([p0, p1, p2, p3])],
+                      fontweight="bold", 
+                      size=10) # Title
+
+          continue
+
+        gradcam_map = torch.clamp(gradcam_map, min=0) 
+
+        x_img.show(ax=ax)
+        ax.imshow(
+            gradcam_map, alpha=.6, extent=(0, size, size,0),
+            interpolation='bicubic', cmap='inferno'
+        )
+        ax.set_axis_off()
+        ax.set_title(str(dls.vocab[i-1]) + ' %0.2f' %[p0, p1, p2, p3][i-1],
+                              fontweight="bold", 
+                              size=10) # Title
+    p0, p1, p2, p3 = output.cpu().detach()[0]
+    print(dls.vocab[np.argmax([p0, p1, p2, p3])])    
+    fig.tight_layout()
+    fig.subplots_adjust(wspace=0.02)
+    plt.show()
+    return (fig, axes, *(np.exp([p0, p1, p2, p3]) / np.exp([p0, p1, p2, p3]).sum()))
+    
+
+fnames
+
+for i in range (70, 90):
+  print(str(fnames[i]))
+  x, = first(dls.test_dl(str(fnames[i])))
+  plot_gradcam(x, learn, learn.model[0])
+
